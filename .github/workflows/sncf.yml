@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: sncf-monitor
+  cancel-in-progress: false
+
 jobs:
   surveillance:
     runs-on: ubuntu-latest
@@ -15,6 +19,8 @@ jobs:
     steps:
       - name: Récupérer le code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Installer Python
         uses: actions/setup-python@v5
@@ -34,6 +40,16 @@ jobs:
         run: |
           git config user.name "SNCF Alert Bot"
           git config user.email "actions@github.com"
+
           git add state.json
-          git diff --cached --quiet || git commit -m "Mise à jour des retards"
+
+          if git diff --cached --quiet; then
+            echo "Aucun changement dans state.json"
+            exit 0
+          fi
+
+          git commit -m "Mise à jour des retards"
+
+          git pull --rebase origin main
+
           git push
