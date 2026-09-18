@@ -120,9 +120,9 @@ def main():
             train_name = get_train_name(trip)
 
             if new_delay:
-                title = f"🚨 Retard SNCF : +{delay_minutes} min"
+                title = f"Retard SNCF : +{delay_minutes} min"
             else:
-                title = f"⚠️ Retard SNCF : +{delay_minutes} min"
+                title = f"Retard SNCF : +{delay_minutes} min"
 
             message = (
                 f"{train_name}\n"
