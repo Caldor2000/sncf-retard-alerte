@@ -6,9 +6,15 @@ import zipfile
 import requests
 from google.transit import gtfs_realtime_pb2
 
-REALTIME_URL = (
+
+TRIP_UPDATES_URL = (
     "https://proxy.transport.data.gouv.fr/"
     "resource/sncf-gtfs-rt-trip-updates"
+)
+
+SERVICE_ALERTS_URL = (
+    "https://proxy.transport.data.gouv.fr/"
+    "resource/sncf-gtfs-rt-service-alerts"
 )
 
 STATIC_URL = (
@@ -23,15 +29,38 @@ STATE_FILE = "state.json"
 MIN_DELAY = 10
 
 
+# ---------------------------------------------------------
+# MÉMOIRE
+# ---------------------------------------------------------
+
 def load_state():
     if not os.path.exists(STATE_FILE):
-        return {}
+        return {
+            "delays": {},
+            "cancellations": {}
+        }
 
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            state = json.load(f)
+
+        # Compatibilité avec l'ancienne version
+        if "delays" not in state:
+            state = {
+                "delays": state,
+                "cancellations": {}
+            }
+
+        if "cancellations" not in state:
+            state["cancellations"] = {}
+
+        return state
+
     except Exception:
-        return {}
+        return {
+            "delays": {},
+            "cancellations": {}
+        }
 
 
 def save_state(state):
@@ -39,7 +68,11 @@ def save_state(state):
         json.dump(state, f)
 
 
-def send_notification(title, message):
+# ---------------------------------------------------------
+# NOTIFICATIONS NTFY
+# ---------------------------------------------------------
+
+def send_notification(title, message, tags="train"):
     if not NTFY_TOPIC:
         raise RuntimeError("NTFY_TOPIC n'est pas configuré.")
 
@@ -48,7 +81,7 @@ def send_notification(title, message):
         headers={
             "Title": title,
             "Priority": "high",
-            "Tags": "train,warning",
+            "Tags": tags,
         },
         data=message.encode("utf-8"),
         timeout=15,
@@ -57,11 +90,16 @@ def send_notification(title, message):
     response.raise_for_status()
 
 
-def get_realtime_feed():
+# ---------------------------------------------------------
+# DONNÉES TEMPS RÉEL
+# ---------------------------------------------------------
+
+def get_feed(url):
     response = requests.get(
-        REALTIME_URL,
+        url,
         timeout=30
     )
+
     response.raise_for_status()
 
     feed = gtfs_realtime_pb2.FeedMessage()
@@ -70,20 +108,34 @@ def get_realtime_feed():
     return feed
 
 
-def get_static_trip_data():
+# ---------------------------------------------------------
+# DONNÉES STATIQUES SNCF
+# ---------------------------------------------------------
+
+def get_static_data():
+
     print("Téléchargement des données horaires SNCF...")
 
     response = requests.get(
         STATIC_URL,
         timeout=60
     )
+
     response.raise_for_status()
 
+    routes = {}
     trips = {}
 
-    with zipfile.ZipFile(io.BytesIO(response.content)) as z:
+    with zipfile.ZipFile(
+        io.BytesIO(response.content)
+    ) as z:
 
-        with z.open("trips.txt") as f:
+        # -------------------------
+        # routes.txt
+        # -------------------------
+
+        with z.open("routes.txt") as f:
+
             text = io.TextIOWrapper(
                 f,
                 encoding="utf-8-sig",
@@ -94,37 +146,127 @@ def get_static_trip_data():
 
             for row in reader:
 
-                trip_id = row.get("trip_id", "")
+                route_id = row.get("route_id", "")
+
+                if not route_id:
+                    continue
+
+                routes[route_id] = {
+                    "short_name": row.get(
+                        "route_short_name",
+                        ""
+                    ),
+                    "long_name": row.get(
+                        "route_long_name",
+                        ""
+                    )
+                }
+
+        # -------------------------
+        # trips.txt
+        # -------------------------
+
+        with z.open("trips.txt") as f:
+
+            text = io.TextIOWrapper(
+                f,
+                encoding="utf-8-sig",
+                newline=""
+            )
+
+            reader = csv.DictReader(text)
+
+            for row in reader:
+
+                trip_id = row.get(
+                    "trip_id",
+                    ""
+                )
 
                 if not trip_id:
                     continue
 
+                route_id = row.get(
+                    "route_id",
+                    ""
+                )
+
+                route = routes.get(
+                    route_id,
+                    {}
+                )
+
                 trips[trip_id] = {
-                    "route_short_name": (
-                        row.get("route_short_name", "")
+
+                    "route_id": route_id,
+
+                    "route_short_name": route.get(
+                        "short_name",
+                        ""
                     ),
-                    "trip_short_name": (
-                        row.get("trip_short_name", "")
+
+                    "route_long_name": route.get(
+                        "long_name",
+                        ""
                     ),
-                    "trip_headsign": (
-                        row.get("trip_headsign", "")
+
+                    "trip_short_name": row.get(
+                        "trip_short_name",
+                        ""
                     ),
+
+                    "trip_headsign": row.get(
+                        "trip_headsign",
+                        ""
+                    )
                 }
 
-    print(f"{len(trips)} trajets horaires chargés.")
+    print(
+        f"{len(trips)} trajets chargés."
+    )
 
     return trips
 
 
-def get_train_information(trip_id, static_trips):
+# ---------------------------------------------------------
+# FILTRE : INOUI / OUIGO / INTERCITÉS
+# ---------------------------------------------------------
+
+def identify_train(trip_id, static_trips):
 
     data = static_trips.get(trip_id)
 
     if not data:
-        return {
-            "number": trip_id,
-            "destination": ""
-        }
+        return None
+
+    text = " ".join([
+        data.get("route_short_name", ""),
+        data.get("route_long_name", ""),
+        data.get("trip_short_name", "")
+    ]).upper()
+
+    # TER = EXCLU
+    if "TER" in text:
+        return None
+
+    # INOUI
+    if "INOUI" in text or "TGV" in text:
+        train_type = "TGV INOUI"
+
+    # OUIGO
+    elif "OUIGO" in text:
+        train_type = "OUIGO"
+
+    # INTERCITÉS
+    elif (
+        "INTERCITES" in text
+        or "INTERCITÉS" in text
+        or "INTERCITE" in text
+    ):
+        train_type = "INTERCITÉS"
+
+    else:
+        return None
 
     number = (
         data.get("trip_short_name")
@@ -132,13 +274,25 @@ def get_train_information(trip_id, static_trips):
         or trip_id
     )
 
-    destination = data.get("trip_headsign", "")
+    destination = data.get(
+        "trip_headsign",
+        ""
+    )
 
     return {
+        "type": train_type,
         "number": number,
-        "destination": destination
+        "destination": destination,
+        "route_id": data.get(
+            "route_id",
+            ""
+        )
     }
 
+
+# ---------------------------------------------------------
+# RETARD
+# ---------------------------------------------------------
 
 def get_delay(trip_update):
 
@@ -146,50 +300,49 @@ def get_delay(trip_update):
 
     for stop in trip_update.stop_time_update:
 
-        delay = None
-
         if (
             stop.HasField("arrival")
             and stop.arrival.HasField("delay")
         ):
-            delay = stop.arrival.delay
+            delays.append(
+                stop.arrival.delay
+            )
 
         elif (
             stop.HasField("departure")
             and stop.departure.HasField("delay")
         ):
-            delay = stop.departure.delay
-
-        if delay is not None:
-            delays.append(delay)
+            delays.append(
+                stop.departure.delay
+            )
 
     if not delays:
         return None
 
-    # Le dernier retard fourni correspond au point
-    # le plus avancé connu sur le trajet.
-    return round(delays[-1] / 60)
+    return round(
+        delays[-1] / 60
+    )
 
 
-def main():
+# ---------------------------------------------------------
+# SURVEILLANCE DES RETARDS
+# ---------------------------------------------------------
 
-    if not NTFY_TOPIC:
-        raise RuntimeError(
-            "Le secret NTFY_TOPIC est absent."
-        )
+def process_delays(
+    feed,
+    static_trips,
+    state
+):
 
-    state = load_state()
-
-    static_trips = get_static_trip_data()
-    feed = get_realtime_feed()
-
-    new_state = {}
+    new_delays = {}
 
     notifications = 0
 
     for entity in feed.entity:
 
-        if not entity.HasField("trip_update"):
+        if not entity.HasField(
+            "trip_update"
+        ):
             continue
 
         trip_update = entity.trip_update
@@ -200,94 +353,275 @@ def main():
         if not trip_id:
             continue
 
-        delay_minutes = get_delay(trip_update)
-
-        if delay_minutes is None:
-            continue
-
-        train = get_train_information(
+        train = identify_train(
             trip_id,
             static_trips
         )
 
-        train_number = train["number"]
-        destination = train["destination"]
+        # Ignore TER + autres trains
+        if not train:
+            continue
 
-        # On conserve le dernier état connu
-        new_state[trip_id] = delay_minutes
+        delay = get_delay(
+            trip_update
+        )
 
-        previous_delay = state.get(trip_id, 0)
+        if delay is None:
+            continue
 
-        # Nouveau retard >= 10 minutes
+        new_delays[trip_id] = delay
+
+        previous_delay = state["delays"].get(
+            trip_id,
+            0
+        )
+
         new_delay = (
             previous_delay < MIN_DELAY
-            and delay_minutes >= MIN_DELAY
+            and delay >= MIN_DELAY
         )
 
-        # Nouvelle aggravation d'au moins 10 minutes
         increased_delay = (
             previous_delay >= MIN_DELAY
-            and delay_minutes >= previous_delay + 10
+            and delay >= previous_delay + 10
         )
 
-        if not (new_delay or increased_delay):
+        if not (
+            new_delay
+            or increased_delay
+        ):
             continue
 
         if increased_delay:
             title = (
-                f"Retard SNCF : +{delay_minutes} min"
+                f"Retard {train['type']} "
+                f"+{delay} min"
             )
         else:
             title = (
-                f"Nouveau retard SNCF : +{delay_minutes} min"
+                f"Nouveau retard "
+                f"{train['type']} "
+                f"+{delay} min"
             )
 
-        message_lines = [
-            f"Train : {train_number}"
-        ]
-
-        if destination:
-            message_lines.append(
-                f"Destination : {destination}"
-            )
-
-        message_lines.append(
-            f"Retard : +{delay_minutes} min"
+        message = (
+            f"Train : {train['number']}\n"
+            f"Destination : "
+            f"{train['destination']}\n"
+            f"Retard : +{delay} min"
         )
-
-        if increased_delay:
-            message_lines.append(
-                f"Précédent : +{previous_delay} min"
-            )
-
-        message = "\n".join(message_lines)
 
         try:
 
             send_notification(
                 title,
-                message
+                message,
+                "train,warning"
             )
 
             notifications += 1
 
             print(
-                f"Notification envoyée : "
-                f"{train_number} "
-                f"+{delay_minutes} min"
+                f"Notification retard : "
+                f"{train['type']} "
+                f"{train['number']} "
+                f"+{delay} min"
             )
 
         except Exception as error:
 
             print(
-                f"Erreur notification : {error}"
+                f"Erreur notification : "
+                f"{error}"
             )
 
-    save_state(new_state)
+    return new_delays, notifications
+
+
+# ---------------------------------------------------------
+# SUPPRESSIONS
+# ---------------------------------------------------------
+
+def process_cancellations(
+    feed,
+    static_trips,
+    state
+):
+
+    new_cancellations = dict(
+        state["cancellations"]
+    )
+
+    notifications = 0
+
+    for entity in feed.entity:
+
+        if not entity.HasField(
+            "alert"
+        ):
+            continue
+
+        alert = entity.alert
+
+        # Nous recherchons uniquement
+        # les suppressions de circulation.
+        if alert.effect != (
+            gtfs_realtime_pb2.Alert.CANCELED
+        ):
+            continue
+
+        for informed in alert.informed_entity:
+
+            trip_id = ""
+
+            if informed.HasField(
+                "trip"
+            ):
+                trip_id = informed.trip.trip_id
+
+            if not trip_id:
+                continue
+
+            train = identify_train(
+                trip_id,
+                static_trips
+            )
+
+            # Ignore TER
+            if not train:
+                continue
+
+            cancellation_key = (
+                trip_id
+                + "_cancelled"
+            )
+
+            if cancellation_key in state[
+                "cancellations"
+            ]:
+                continue
+
+            new_cancellations[
+                cancellation_key
+            ] = True
+
+            title = (
+                f"Train supprimé - "
+                f"{train['type']}"
+            )
+
+            message = (
+                f"Train : {train['number']}\n"
+                f"Destination : "
+                f"{train['destination']}\n"
+                f"Le train est indiqué "
+                f"comme supprimé."
+            )
+
+            try:
+
+                send_notification(
+                    title,
+                    message,
+                    "train,no_entry"
+                )
+
+                notifications += 1
+
+                print(
+                    f"Notification suppression : "
+                    f"{train['type']} "
+                    f"{train['number']}"
+                )
+
+            except Exception as error:
+
+                print(
+                    f"Erreur notification : "
+                    f"{error}"
+                )
+
+    return (
+        new_cancellations,
+        notifications
+    )
+
+
+# ---------------------------------------------------------
+# PROGRAMME PRINCIPAL
+# ---------------------------------------------------------
+
+def main():
+
+    if not NTFY_TOPIC:
+        raise RuntimeError(
+            "Le secret NTFY_TOPIC est absent."
+        )
+
+    state = load_state()
+
+    static_trips = get_static_data()
+
+    # -------------------------------------
+    # RETARDS
+    # -------------------------------------
+
+    print(
+        "Lecture du flux des retards..."
+    )
+
+    delay_feed = get_feed(
+        TRIP_UPDATES_URL
+    )
+
+    new_delays, delay_notifications = (
+        process_delays(
+            delay_feed,
+            static_trips,
+            state
+        )
+    )
+
+    # -------------------------------------
+    # SUPPRESSIONS
+    # -------------------------------------
+
+    print(
+        "Lecture du flux des suppressions..."
+    )
+
+    alert_feed = get_feed(
+        SERVICE_ALERTS_URL
+    )
+
+    (
+        new_cancellations,
+        cancellation_notifications
+    ) = process_cancellations(
+        alert_feed,
+        static_trips,
+        state
+    )
+
+    # -------------------------------------
+    # SAUVEGARDE
+    # -------------------------------------
+
+    state = {
+        "delays": new_delays,
+        "cancellations": new_cancellations
+    }
+
+    save_state(state)
+
+    total = (
+        delay_notifications
+        + cancellation_notifications
+    )
 
     print(
         f"Surveillance terminée : "
-        f"{notifications} notification(s)."
+        f"{total} notification(s)."
     )
 
 
