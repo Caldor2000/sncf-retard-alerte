@@ -37,32 +37,32 @@ jobs:
         run: python sncf_monitor.py
 
       - name: Sauvegarder la mémoire des retards
-  run: |
-    git config user.name "SNCF Alert Bot"
-    git config user.email "actions@github.com"
+        run: |
+          git config user.name "SNCF Alert Bot"
+          git config user.email "actions@github.com"
 
-    git add state.json
+          git add state.json
 
-    if git diff --cached --quiet; then
-      echo "Aucun changement dans state.json"
-      exit 0
-    fi
+          if git diff --cached --quiet; then
+            echo "Aucun changement dans state.json"
+            exit 0
+          fi
 
-    git commit -m "Mise à jour des retards"
+          git commit -m "Mise à jour des retards"
 
-    for i in 1 2 3 4 5
-    do
-      git fetch origin main
-      git rebase origin/main
+          for i in 1 2 3 4 5
+          do
+            git fetch origin main
+            git rebase origin/main
 
-      if git push origin HEAD:main; then
-        echo "Push réussi"
-        exit 0
-      fi
+            if git push origin HEAD:main; then
+              echo "Push réussi"
+              exit 0
+            fi
 
-      echo "Push échoué, nouvelle tentative..."
-      sleep 2
-    done
+            echo "Push échoué, nouvelle tentative..."
+            sleep 2
+          done
 
-    echo "Impossible de pousser après 5 tentatives"
-    exit 1
+          echo "Impossible de pousser après 5 tentatives"
+          exit 1
