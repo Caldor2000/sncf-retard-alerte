@@ -4,40 +4,37 @@ import csv
 import io
 import zipfile
 import re
-import requests
+from datetime import datetime, timedelta
 
+import requests
 from google.transit import gtfs_realtime_pb2
 
 
 TRIP_UPDATES_URL = (
-    "https://proxy.transport.data.gouv.fr/"
-    "resource/sncf-gtfs-rt-trip-updates"
+    "https://proxy.transport.data.gouv.fr/resource/"
+    "sncf-gtfs-rt-trip-updates"
 )
 
 SERVICE_ALERTS_URL = (
-    "https://proxy.transport.data.gouv.fr/"
-    "resource/sncf-gtfs-rt-service-alerts"
+    "https://proxy.transport.data.gouv.fr/resource/"
+    "sncf-gtfs-rt-service-alerts"
 )
 
-STATIC_URL = (
+GTFS_URL = (
     "https://eu.ftp.opendatasoft.com/sncf/plandata/"
     "Export_OpenData_SNCF_GTFS_NewTripId.zip"
 )
 
-NTFY_URL = "https://ntfy.sh"
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC")
 
 STATE_FILE = "state.json"
 
-MIN_DELAY = 10
 
-
-# =========================================================
-# MÉMOIRE
-# =========================================================
+# ============================================================
+# ÉTAT
+# ============================================================
 
 def load_state():
-
     if not os.path.exists(STATE_FILE):
         return {
             "delays": {},
@@ -45,30 +42,25 @@ def load_state():
         }
 
     try:
-
-        with open(
-            STATE_FILE,
-            "r",
-            encoding="utf-8"
-        ) as f:
-
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
             state = json.load(f)
 
-        # Compatibilité avec l'ancienne version
+        # Compatibilité avec l'ancien format :
+        # {
+        #   "trip_id": 10
+        # }
         if "delays" not in state:
-
             state = {
                 "delays": state,
                 "cancellations": {}
             }
 
-        if "cancellations" not in state:
-            state["cancellations"] = {}
+        state.setdefault("delays", {})
+        state.setdefault("cancellations", {})
 
         return state
 
     except Exception:
-
         return {
             "delays": {},
             "cancellations": {}
@@ -76,110 +68,74 @@ def load_state():
 
 
 def save_state(state):
-
-    with open(
-        STATE_FILE,
-        "w",
-        encoding="utf-8"
-    ) as f:
-
-        json.dump(
-            state,
-            f,
-            ensure_ascii=False,
-            indent=2
-        )
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2, ensure_ascii=False)
 
 
-# =========================================================
-# NOTIFICATION NTFY
-# =========================================================
+# ============================================================
+# NOTIFICATIONS
+# ============================================================
 
-def send_notification(
-    title,
-    message,
-    tags="train"
-):
-
+def notify(title, message):
     if not NTFY_TOPIC:
-        raise RuntimeError(
-            "NTFY_TOPIC n'est pas configuré."
-        )
+        print("NTFY_TOPIC absent")
+        return
+
+    url = f"https://ntfy.sh/{NTFY_TOPIC}"
+
+    headers = {
+        "Title": title,
+        "Priority": "high"
+    }
 
     response = requests.post(
-
-        f"{NTFY_URL}/{NTFY_TOPIC}",
-
-        headers={
-            "Title": title,
-            "Priority": "high",
-            "Tags": tags
-        },
-
-        data=message.encode("utf-8"),
-
-        timeout=15
-    )
-
-    response.raise_for_status()
-
-
-# =========================================================
-# FLUX GTFS-RT
-# =========================================================
-
-def get_feed(url):
-
-    response = requests.get(
         url,
-        timeout=30
+        data=message.encode("utf-8"),
+        headers=headers,
+        timeout=20
     )
 
+    print("Notification:", response.status_code)
+
+    if response.status_code >= 400:
+        print(response.text)
+
+
+# ============================================================
+# GTFS-RT
+# ============================================================
+
+def download_feed(url):
+    response = requests.get(url, timeout=30)
     response.raise_for_status()
 
-    feed = (
-        gtfs_realtime_pb2.FeedMessage()
-    )
-
-    feed.ParseFromString(
-        response.content
-    )
+    feed = gtfs_realtime_pb2.FeedMessage()
+    feed.ParseFromString(response.content)
 
     return feed
 
 
-# =========================================================
+# ============================================================
 # DONNÉES STATIQUES SNCF
-# =========================================================
+# ============================================================
 
-def get_static_data():
+def load_static_data():
+    print("Téléchargement du GTFS statique...")
 
-    print(
-        "Téléchargement des données horaires SNCF..."
-    )
-
-    response = requests.get(
-        STATIC_URL,
-        timeout=60
-    )
-
+    response = requests.get(GTFS_URL, timeout=60)
     response.raise_for_status()
 
     routes = {}
     trips = {}
+    first_departures = {}
 
-    with zipfile.ZipFile(
-        io.BytesIO(response.content)
-    ) as archive:
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
 
-        # -------------------------------------------------
+        # ----------------------------------------------------
         # ROUTES
-        # -------------------------------------------------
+        # ----------------------------------------------------
 
-        with archive.open(
-            "routes.txt"
-        ) as file:
-
+        with archive.open("routes.txt") as file:
             text = io.TextIOWrapper(
                 file,
                 encoding="utf-8-sig",
@@ -189,24 +145,45 @@ def get_static_data():
             reader = csv.DictReader(text)
 
             for row in reader:
-
-                route_id = row.get(
-                    "route_id",
-                    ""
-                )
-
-                if not route_id:
-                    continue
+                route_id = row.get("route_id", "")
 
                 routes[route_id] = {
-                    "short_name": row.get(
-                        "route_short_name",
+                    "short_name": row.get("route_short_name", ""),
+                    "long_name": row.get("route_long_name", "")
+                }
+
+        # ----------------------------------------------------
+        # TRIPS
+        # ----------------------------------------------------
+
+        with archive.open("trips.txt") as file:
+            text = io.TextIOWrapper(
+                file,
+                encoding="utf-8-sig",
+                newline=""
+            )
+
+            reader = csv.DictReader(text)
+
+            for row in reader:
+                trip_id = row.get("trip_id", "")
+
+                if not trip_id:
+                    continue
+
+                route_id = row.get("route_id", "")
+
+                trips[trip_id] = {
+                    "route_id": route_id,
+                    "trip_short_name": row.get(
+                        "trip_short_name",
                         ""
                     ),
-                    "long_name": row.get(
-                        "route_long_name",
+                    "trip_headsign": row.get(
+                        "trip_headsign",
                         ""
-                    )
+                    ),
+                    "departure_time": ""
                 }
 
 # -------------------------------------------------
@@ -336,143 +313,130 @@ with archive.open(
                     departure_time
                 )
 
-    print(
-        f"{len(trips)} trajets chargés."
-    )
+    print(f"{len(routes)} lignes chargées")
+    print(f"{len(trips)} trains chargés")
 
-    return trips
+    return routes, trips
 
 
-# =========================================================
+# ============================================================
 # IDENTIFICATION DU TRAIN
-# =========================================================
+# ============================================================
 
-def identify_train(
-    trip_id,
-    static_trips
-):
-
-    data = static_trips.get(
-        trip_id
-    )
+def identify_train(trip_id, routes, trips):
+    data = trips.get(trip_id)
 
     if not data:
         return None
 
-    route_short = data.get(
-        "route_short_name",
-        ""
-    )
+    route_id = data.get("route_id", "")
 
-    route_long = data.get(
-        "route_long_name",
+    route = routes.get(route_id, {})
+
+    route_short = route.get(
+        "short_name",
         ""
-    )
+    ).strip()
+
+    route_long = route.get(
+        "long_name",
+        ""
+    ).strip()
 
     trip_short = data.get(
         "trip_short_name",
         ""
-    )
+    ).strip()
 
     trip_headsign = data.get(
         "trip_headsign",
         ""
-    )
+    ).strip()
 
-    full_text = " ".join([
+    search_text = " ".join([
         route_short,
         route_long,
         trip_short,
         trip_headsign
     ]).upper()
 
-    # -----------------------------------------------------
+    # --------------------------------------------------------
     # EXCLUSION TER
-    # -----------------------------------------------------
+    # --------------------------------------------------------
 
-    if "TER" in full_text:
+    if (
+        "TER" in search_text
+        or "TRANSILIEN" in search_text
+        or "RER" in search_text
+    ):
         return None
 
-    # -----------------------------------------------------
+    # --------------------------------------------------------
     # TYPE DE TRAIN
-    # -----------------------------------------------------
+    # --------------------------------------------------------
 
-    if "OUIGO" in full_text:
-
+    if "OUIGO" in search_text:
         train_type = "OUIGO"
 
     elif (
-        "INTERCITES" in full_text
-        or "INTERCITÉS" in full_text
-        or "INTERCITE" in full_text
+        "INTERCITÉS" in search_text
+        or "INTERCITES" in search_text
     ):
-
         train_type = "INTERCITÉS"
 
-    elif "TGV" in full_text:
-
+    elif (
+        "TGV INOUI" in search_text
+        or "TGV INOUI" in route_long.upper()
+        or "INOUI" in search_text
+    ):
         train_type = "TGV INOUI"
 
     else:
-
         return None
 
-    # -----------------------------------------------------
+    # --------------------------------------------------------
     # NUMÉRO COMMERCIAL
-    # -----------------------------------------------------
+    # --------------------------------------------------------
 
     commercial_number = ""
 
-    # Dans le flux SNCF utilisé ici,
-    # le trip_headsign peut contenir le numéro commercial.
-    candidate = trip_headsign.strip()
+    # Dans le GTFS SNCF, le numéro est souvent dans
+    # trip_headsign.
+    if trip_headsign.isdigit():
+        commercial_number = trip_headsign
 
-    if re.fullmatch(
-        r"\d{1,6}",
-        candidate
-    ):
+    elif trip_short.isdigit():
+        commercial_number = trip_short
 
-        commercial_number = candidate
+    else:
+        numbers = re.findall(
+            r"\b\d{3,5}\b",
+            trip_headsign
+        )
 
-    # Sinon on essaie trip_short_name
-    if not commercial_number:
-
-        candidate = trip_short.strip()
-
-        if re.fullmatch(
-            r"\d{1,6}",
-            candidate
-        ):
-
-            commercial_number = candidate
-
-        else:
-
-            match = re.search(
-                r"\b\d{3,6}\b",
-                candidate
-            )
-
-            if match:
-                commercial_number = (
-                    match.group(0)
-                )
+        if numbers:
+            commercial_number = numbers[0]
 
     if not commercial_number:
+        commercial_number = "numéro non dispo"
 
-        commercial_number = "Numéro non disponible"
-
-    # -----------------------------------------------------
+    # --------------------------------------------------------
     # DESTINATION
-    # -----------------------------------------------------
+    # --------------------------------------------------------
 
-    # Pour l'instant on utilise route_long_name
-    # afin de ne plus afficher le numéro comme destination.
-    destination = route_long.strip()
+    destination = route_long
 
     if not destination:
-
         destination = "Destination non disponible"
+
+    # --------------------------------------------------------
+    # DÉPART
+    # --------------------------------------------------------
+
+    departure_time = data.get(
+        "departure_time",
+        ""
+    )
 
     return {
     "type": train_type,
@@ -485,118 +449,127 @@ def identify_train(
 }
 
 
-# =========================================================
-# CALCUL DU RETARD
-# =========================================================
+# ============================================================
+# RETARD
+# ============================================================
 
-def get_delay(trip_update):
+def get_delay(trip):
+    """
+    Retourne le retard en secondes.
+    """
 
-    delays = []
+    latest_delay = None
 
-    for stop in (
-        trip_update.stop_time_update
-    ):
+    for stop in trip.stop_time_update:
+        if stop.HasField("departure"):
+            if stop.departure.HasField("delay"):
+                latest_delay = stop.departure.delay
 
-        if (
-            stop.HasField("arrival")
-            and stop.arrival.HasField("delay")
-        ):
+        if stop.HasField("arrival"):
+            if stop.arrival.HasField("delay"):
+                latest_delay = stop.arrival.delay
 
-            delays.append(
-                stop.arrival.delay
-            )
+    if latest_delay is None:
+        return 0
 
-        elif (
-            stop.HasField("departure")
-            and stop.departure.HasField("delay")
-        ):
+    return latest_delay
 
-            delays.append(
-                stop.departure.delay
-            )
 
-    if not delays:
-        return None
+def format_time(time_string):
+    if not time_string:
+        return "Non disponible"
 
-    # Le dernier retard connu
-    # est le plus pertinent pour l'alerte.
-    return round(
-        delays[-1] / 60
+    return time_string[:5]
+
+
+def estimated_departure(scheduled_time, delay_minutes):
+    if not scheduled_time:
+        return "Non disponible"
+
+    try:
+        hour, minute = scheduled_time[:5].split(":")
+
+        base = datetime(
+            2000,
+            1,
+            1,
+            int(hour),
+            int(minute)
+        )
+
+        estimated = base + timedelta(
+            minutes=delay_minutes
+        )
+
+        return estimated.strftime("%H:%M")
+
+    except Exception:
+        return "Non disponible"
+
+
+# ============================================================
+# TRAITEMENT DES RETARDS
+# ============================================================
+
+def process_delays(feed, routes, trips, state):
+    previous_delays = state.setdefault(
+        "delays",
+        {}
     )
 
-
-# =========================================================
-# RETARDS
-# =========================================================
-
-def process_delays(
-    feed,
-    static_trips,
-    state
-):
-
-    new_delays = {}
-
-    notifications = 0
+    current_delays = {}
 
     for entity in feed.entity:
 
-        if not entity.HasField(
-            "trip_update"
-        ):
+        if not entity.HasField("trip_update"):
             continue
 
         trip_update = entity.trip_update
 
-        trip = trip_update.trip
+        if not trip_update.HasField("trip"):
+            continue
 
-        trip_id = trip.trip_id
+        trip_id = trip_update.trip.trip_id
 
         if not trip_id:
             continue
 
         train = identify_train(
             trip_id,
-            static_trips
+            routes,
+            trips
         )
 
-        # TER et autres trains ignorés
         if not train:
             continue
 
-        delay = get_delay(
-            trip_update
+        delay_seconds = get_delay(trip_update)
+
+        delay_minutes = int(
+            round(delay_seconds / 60)
         )
 
-        if delay is None:
+        # On ignore les retards inférieurs à 10 minutes
+        if delay_minutes < 10:
+            current_delays[trip_id] = delay_minutes
             continue
 
-        new_delays[trip_id] = delay
-
-        previous_delay = state[
-            "delays"
-        ].get(
+        previous_delay = previous_delays.get(
             trip_id,
             0
         )
 
-        # Premier passage au-dessus de 10 min
-        new_delay = (
-            previous_delay < MIN_DELAY
-            and delay >= MIN_DELAY
+        # Première alerte à partir de 10 minutes
+        first_alert = (
+            previous_delay < 10
         )
 
-        # Hausse d'au moins 10 min
-        increased_delay = (
-            previous_delay >= MIN_DELAY
-            and delay >= previous_delay + 10
+        # Nouvelle alerte si le retard augmente
+        increase_alert = (
+            delay_minutes >= previous_delay + 10
         )
 
-        if not (
-            new_delay
-            or increased_delay
-        ):
-            continue
+        if first_alert or increase_alert:
 
         departure_time = train.get(
             "departure_time",
@@ -690,278 +663,169 @@ def process_delays(
                 f"Retard : +{delay} min"
             )
 
-        try:
+            if previous_delay >= 10:
+                message += (
+                    f"\nRetard précédent : "
+                    f"+{previous_delay} min"
+                )
 
-            send_notification(
-                title,
-                message,
-                "train,warning"
+            notify(
+                f"{train['type']} {train['number']} en retard",
+                message
             )
 
-            notifications += 1
-
-            print(
-                f"Alerte retard : "
-                f"{train['type']} "
-                f"{train['number']} "
-                f"+{delay} min"
-            )
-
-        except Exception as error:
-
-            print(
-                f"Erreur notification : "
-                f"{error}"
-            )
-
-    return (
-        new_delays,
-        notifications
-    )
+    state["delays"] = current_delays
 
 
-# =========================================================
-# SUPPRESSIONS
-# =========================================================
+# ============================================================
+# ANNULATIONS
+# ============================================================
 
 def process_cancellations(
     feed,
-    static_trips,
+    routes,
+    trips,
     state
 ):
-
-    new_cancellations = dict(
-        state["cancellations"]
+    previous_cancellations = state.setdefault(
+        "cancellations",
+        {}
     )
 
-    notifications = 0
+    current_cancellations = {}
 
     for entity in feed.entity:
 
-        if not entity.HasField(
-            "alert"
-        ):
+        if not entity.HasField("alert"):
             continue
 
         alert = entity.alert
 
-        # -------------------------------------------------
-        # GTFS-RT : NO_SERVICE = service supprimé
-        # -------------------------------------------------
-
-        if alert.effect != (
-            gtfs_realtime_pb2.Alert.NO_SERVICE
-        ):
-
+        # GTFS-RT :
+        # NO_SERVICE = service supprimé / annulé
+        if alert.effect != gtfs_realtime_pb2.Alert.NO_SERVICE:
             continue
 
-        for informed in (
-            alert.informed_entity
-        ):
+        for informed_entity in alert.informed_entity:
 
-            if not informed.HasField(
-                "trip"
-            ):
-
+            if not informed_entity.HasField("trip"):
                 continue
 
-            trip_id = (
-                informed.trip.trip_id
-            )
+            trip_id = informed_entity.trip.trip_id
 
             if not trip_id:
                 continue
 
             train = identify_train(
                 trip_id,
-                static_trips
+                routes,
+                trips
             )
 
-            # TER et autres trains ignorés
             if not train:
                 continue
-
-            # -------------------------------------------------
-            # CLÉ ANTI-SPAM
-            # -------------------------------------------------
 
             cancellation_key = (
                 f"{entity.id}:{trip_id}"
             )
 
-            if cancellation_key in (
-                state["cancellations"]
-            ):
-
-                continue
-
-            new_cancellations[
+            current_cancellations[
                 cancellation_key
             ] = True
 
-            title = (
-                f"{train['type']} "
-                f"{train['number']} "
-                f"SUPPRIMÉ"
+            if cancellation_key in previous_cancellations:
+                continue
+
+            scheduled = format_time(
+                train["departure_time"]
             )
 
             message = (
+                f"{train['type']} "
+                f"{train['number']} SUPPRIMÉ\n"
+                f"Départ prévu : {scheduled}\n"
                 f"Destination : "
                 f"{train['destination']}\n"
-                f"Le train est indiqué "
-                f"comme supprimé par SNCF."
+                f"Le train est indiqué comme "
+                f"supprimé par SNCF."
             )
 
-            # Ajout du message SNCF si disponible
-            if alert.HasField(
-                "header_text"
-            ):
+            notify(
+                f"{train['type']} "
+                f"{train['number']} SUPPRIMÉ",
+                message
+            )
 
-                header = (
-                    alert.header_text
-                    .translation[0]
-                    .text
-                )
-
-                if header:
-                    message += (
-                        f"\n\n{header}"
-                    )
-
-            try:
-
-                send_notification(
-                    title,
-                    message,
-                    "train,no_entry"
-                )
-
-                notifications += 1
-
-                print(
-                    f"Alerte suppression : "
-                    f"{train['type']} "
-                    f"{train['number']}"
-                )
-
-            except Exception as error:
-
-                print(
-                    f"Erreur notification : "
-                    f"{error}"
-                )
-
-    return (
-        new_cancellations,
-        notifications
+    state["cancellations"] = (
+        current_cancellations
     )
 
 
-# =========================================================
+# ============================================================
 # PROGRAMME PRINCIPAL
-# =========================================================
+# ============================================================
 
 def main():
 
-    if not NTFY_TOPIC:
-
-        raise RuntimeError(
-            "Le secret NTFY_TOPIC est absent."
-        )
-
-    print(
-        "================================"
-    )
-
-    print(
-        "SURVEILLANCE SNCF"
-    )
-
-    print(
-        "TGV INOUI / OUIGO / INTERCITÉS"
-    )
-
-    print(
-        "TER EXCLUS"
-    )
-
-    print(
-        "================================"
-    )
+    print("================================")
+    print("SNCF MONITOR")
+    print("================================")
 
     state = load_state()
 
-    static_trips = get_static_data()
+    routes, trips = load_static_data()
 
-    # -----------------------------------------------------
+    # --------------------------------------------------------
     # RETARDS
-    # -----------------------------------------------------
+    # --------------------------------------------------------
 
-    print(
-        "Lecture des retards..."
-    )
+    print("Téléchargement des retards...")
 
-    delay_feed = get_feed(
+    trip_feed = download_feed(
         TRIP_UPDATES_URL
     )
 
-    (
-        new_delays,
-        delay_notifications
-    ) = process_delays(
-        delay_feed,
-        static_trips,
+    print(
+        f"{len(trip_feed.entity)} "
+        f"mises à jour reçues"
+    )
+
+    process_delays(
+        trip_feed,
+        routes,
+        trips,
         state
     )
 
-    # -----------------------------------------------------
-    # SUPPRESSIONS
-    # -----------------------------------------------------
+    # --------------------------------------------------------
+    # ANNULATIONS
+    # --------------------------------------------------------
 
-    print(
-        "Lecture des suppressions..."
-    )
+    print("Téléchargement des suppressions...")
 
-    alert_feed = get_feed(
+    alert_feed = download_feed(
         SERVICE_ALERTS_URL
     )
 
-    (
-        new_cancellations,
-        cancellation_notifications
-    ) = process_cancellations(
+    print(
+        f"{len(alert_feed.entity)} "
+        f"alertes reçues"
+    )
+
+    process_cancellations(
         alert_feed,
-        static_trips,
+        routes,
+        trips,
         state
     )
 
-    # -----------------------------------------------------
+    # --------------------------------------------------------
     # SAUVEGARDE
-    # -----------------------------------------------------
-
-    state = {
-        "delays": new_delays,
-        "cancellations": new_cancellations
-    }
+    # --------------------------------------------------------
 
     save_state(state)
 
-    total = (
-        delay_notifications
-        + cancellation_notifications
-    )
-
-    print(
-        "================================"
-    )
-
-    print(
-        f"Terminé : {total} notification(s)"
-    )
-
-    print(
-        "================================"
-    )
+    print("Surveillance terminée.")
 
 
 if __name__ == "__main__":
