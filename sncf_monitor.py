@@ -312,10 +312,16 @@ def identify_train(
         ""
     )
 
+    trip_headsign = data.get(
+        "trip_headsign",
+        ""
+    )
+
     full_text = " ".join([
         route_short,
         route_long,
-        trip_short
+        trip_short,
+        trip_headsign
     ]).upper()
 
     # -----------------------------------------------------
@@ -355,14 +361,22 @@ def identify_train(
 
     commercial_number = ""
 
-    # trip_short_name est normalement
-    # le numéro commercial du train.
-    if trip_short:
+    # Dans le flux SNCF utilisé ici,
+    # le trip_headsign peut contenir le numéro commercial.
+    candidate = trip_headsign.strip()
+
+    if re.fullmatch(
+        r"\d{1,6}",
+        candidate
+    ):
+
+        commercial_number = candidate
+
+    # Sinon on essaie trip_short_name
+    if not commercial_number:
 
         candidate = trip_short.strip()
 
-        # On accepte un numéro simple,
-        # par exemple 6123, 9876, etc.
         if re.fullmatch(
             r"\d{1,6}",
             candidate
@@ -372,7 +386,6 @@ def identify_train(
 
         else:
 
-            # Recherche d'un numéro dans le texte
             match = re.search(
                 r"\b\d{3,6}\b",
                 candidate
@@ -383,20 +396,20 @@ def identify_train(
                     match.group(0)
                 )
 
-    # Si impossible à déterminer,
-    # on n'affiche PAS le trip_id technique.
     if not commercial_number:
 
         commercial_number = "Numéro non disponible"
 
-    destination = (
-        data.get(
-            "trip_headsign",
-            ""
-        ).strip()
-    )
+    # -----------------------------------------------------
+    # DESTINATION
+    # -----------------------------------------------------
+
+    # Pour l'instant on utilise route_long_name
+    # afin de ne plus afficher le numéro comme destination.
+    destination = route_long.strip()
 
     if not destination:
+
         destination = "Destination non disponible"
 
     return {
