@@ -189,37 +189,67 @@ def estimated_time(scheduled, delay_minutes):
 def process_delays(feed, routes, trips, state):
     old_delays = state["delays"]
     new_delays = {}
+
+    total_trains = 0
+    recognized_trains = 0
+    delayed_trains = 0
+    notifications_sent = 0
+
     for entity in feed.entity:
+
         if not entity.HasField("trip_update"):
             continue
+
         trip_update = entity.trip_update
+
         if not trip_update.HasField("trip"):
             continue
+
+        total_trains += 1
+
         trip_id = trip_update.trip.trip_id
+
         if not trip_id:
             continue
+
         train = identify_train(
             trip_id,
             routes,
             trips
         )
+
         if not train:
             continue
+
+        recognized_trains += 1
+
         delay_seconds = get_delay(trip_update)
         delay_minutes = int(round(delay_seconds / 60))
+
         new_delays[trip_id] = delay_minutes
+
         if delay_minutes < 10:
             continue
+
+        delayed_trains += 1
+
         previous = old_delays.get(trip_id, 0)
+
         first_alert = previous < 10
         increased = delay_minutes >= previous + 10
+
         if not first_alert and not increased:
             continue
-        scheduled = format_time(train["departure_time"])
+
+        scheduled = format_time(
+            train["departure_time"]
+        )
+
         estimated = estimated_time(
             train["departure_time"],
             delay_minutes
         )
+
         message = (
             f"{train['type']} {train['number']}\n"
             f"Départ prévu : {scheduled}\n"
@@ -227,13 +257,28 @@ def process_delays(feed, routes, trips, state):
             f"Destination : {train['destination']}\n"
             f"Retard actuel : +{delay_minutes} min"
         )
+
         if previous >= 10:
-            message += f"\nRetard précédent : +{previous} min"
+            message += (
+                f"\nRetard précédent : +{previous} min"
+            )
+
         notify(
             f"{train['type']} {train['number']} en retard",
             message
         )
+
+        notifications_sent += 1
+
     state["delays"] = new_delays
+
+    print("--------------------------------")
+    print("DIAGNOSTIC RETARDS")
+    print(f"Trains analysés : {total_trains}")
+    print(f"Trains reconnus : {recognized_trains}")
+    print(f"Trains avec >= 10 min : {delayed_trains}")
+    print(f"Notifications envoyées : {notifications_sent}")
+    print("--------------------------------")
 def process_cancellations(feed, routes, trips, state):
     old_cancellations = state["cancellations"]
     new_cancellations = {}
