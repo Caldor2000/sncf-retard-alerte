@@ -29,3 +29,11 @@ jobs:
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         run: python sncf_monitor.py
+
+      - name: Sauvegarder la mémoire des retards
+        run: |
+          git config user.name "SNCF Alert Bot"
+          git config user.email "actions@github.com"
+          git add state.json
+          git diff --cached --quiet || git commit -m "Mise à jour des retards"
+          git push
