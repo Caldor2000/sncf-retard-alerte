@@ -208,6 +208,10 @@ def process_delays(feed, routes, trips, state):
         total_trains += 1
 
         trip_id = trip_update.trip.trip_id
+        
+        if total_trains <= 5:
+    print("DEBUG TRIP ID :", trip_id)
+    print("DEBUG STATIQUE :", trips.get(trip_id))
 
         if not trip_id:
             continue
