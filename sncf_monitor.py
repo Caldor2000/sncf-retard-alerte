@@ -186,57 +186,132 @@ def load_static_data():
                     "departure_time": ""
                 }
 
-        # ----------------------------------------------------
-        # STOP TIMES
-        # ----------------------------------------------------
+# -------------------------------------------------
+# TRIPS
+# -------------------------------------------------
 
-        with archive.open("stop_times.txt") as file:
-            text = io.TextIOWrapper(
-                file,
-                encoding="utf-8-sig",
-                newline=""
+with archive.open(
+    "trips.txt"
+) as file:
+
+    text = io.TextIOWrapper(
+        file,
+        encoding="utf-8-sig",
+        newline=""
+    )
+
+    reader = csv.DictReader(text)
+
+    for row in reader:
+
+        trip_id = row.get(
+            "trip_id",
+            ""
+        )
+
+        if not trip_id:
+            continue
+
+        route_id = row.get(
+            "route_id",
+            ""
+        )
+
+        route = routes.get(
+            route_id,
+            {}
+        )
+
+        trips[trip_id] = {
+
+            "route_id": route_id,
+
+            "route_short_name":
+                route.get(
+                    "short_name",
+                    ""
+                ),
+
+            "route_long_name":
+                route.get(
+                    "long_name",
+                    ""
+                ),
+
+            "trip_short_name":
+                row.get(
+                    "trip_short_name",
+                    ""
+                ),
+
+            "trip_headsign":
+                row.get(
+                    "trip_headsign",
+                    ""
+                ),
+
+            "departure_time": ""
+        }
+        
+# -------------------------------------------------
+# STOP TIMES
+# -------------------------------------------------
+
+with archive.open(
+    "stop_times.txt"
+) as file:
+
+    text = io.TextIOWrapper(
+        file,
+        encoding="utf-8-sig",
+        newline=""
+    )
+
+    reader = csv.DictReader(text)
+
+    first_stop_sequence = {}
+
+    for row in reader:
+
+        trip_id = row.get(
+            "trip_id",
+            ""
+        )
+
+        if not trip_id:
+            continue
+
+        stop_sequence = row.get(
+            "stop_sequence",
+            ""
+        )
+
+        departure_time = row.get(
+            "departure_time",
+            ""
+        )
+
+        if not departure_time:
+            continue
+
+        try:
+            sequence = int(
+                stop_sequence
             )
+        except ValueError:
+            continue
 
-            reader = csv.DictReader(text)
+        if (
+            trip_id not in first_stop_sequence
+            or sequence < first_stop_sequence[trip_id]
+        ):
 
-            for row in reader:
-                trip_id = row.get("trip_id", "")
+            first_stop_sequence[trip_id] = sequence
 
-                if trip_id not in trips:
-                    continue
-
-                stop_sequence = row.get(
-                    "stop_sequence",
-                    ""
+            if trip_id in trips:
+                trips[trip_id]["departure_time"] = (
+                    departure_time
                 )
-
-                try:
-                    sequence = int(stop_sequence)
-                except Exception:
-                    continue
-
-                departure_time = row.get(
-                    "departure_time",
-                    ""
-                )
-
-                if not departure_time:
-                    continue
-
-                current = first_departures.get(trip_id)
-
-                if current is None or sequence < current["sequence"]:
-                    first_departures[trip_id] = {
-                        "sequence": sequence,
-                        "departure_time": departure_time
-                    }
-
-    # Ajouter le premier départ à chaque train
-    for trip_id, data in first_departures.items():
-        if trip_id in trips:
-            trips[trip_id]["departure_time"] = data[
-                "departure_time"
-            ]
 
     print(f"{len(routes)} lignes chargées")
     print(f"{len(trips)} trains chargés")
@@ -364,11 +439,14 @@ def identify_train(trip_id, routes, trips):
     )
 
     return {
-        "type": train_type,
-        "number": commercial_number,
-        "destination": destination,
-        "departure_time": departure_time
-    }
+    "type": train_type,
+    "number": commercial_number,
+    "destination": destination,
+    "departure_time": data.get(
+        "departure_time",
+        ""
+    )
+}
 
 
 # ============================================================
@@ -493,21 +571,96 @@ def process_delays(feed, routes, trips, state):
 
         if first_alert or increase_alert:
 
-            scheduled = format_time(
-                train["departure_time"]
+        departure_time = train.get(
+            "departure_time",
+            ""
+        )
+
+        if departure_time:
+            departure_time = (
+                departure_time[:5]
+            )
+        else:
+            departure_time = (
+                "Heure non disponible"
             )
 
-            estimated = estimated_departure(
-                train["departure_time"],
-                delay_minutes
+        # Calcul de l'heure de départ estimée
+        estimated_time = ""
+
+        if (
+            departure_time !=
+            "Heure non disponible"
+        ):
+
+            try:
+
+                hours, minutes = map(
+                    int,
+                    departure_time.split(":")
+                )
+
+                total_minutes = (
+                    hours * 60
+                    + minutes
+                    + delay
+                )
+
+                estimated_hours = (
+                    total_minutes // 60
+                ) % 24
+
+                estimated_minutes = (
+                    total_minutes % 60
+                )
+
+                estimated_time = (
+                    f"{estimated_hours:02d}:"
+                    f"{estimated_minutes:02d}"
+                )
+
+            except Exception:
+
+                estimated_time = (
+                    "Heure non disponible"
+                )
+
+        else:
+
+            estimated_time = (
+                "Heure non disponible"
             )
+
+        title = (
+            f"{train['type']} "
+            f"{train['number']} "
+            f"+{delay} min"
+        )
+
+        if increased_delay:
 
             message = (
-                f"{train['type']} {train['number']}\n"
-                f"Départ prévu : {scheduled}\n"
-                f"Départ estimé : {estimated}\n"
-                f"Destination : {train['destination']}\n"
-                f"Retard actuel : +{delay_minutes} min"
+                f"Départ prévu : "
+                f"{departure_time}\n"
+                f"Départ estimé : "
+                f"{estimated_time}\n"
+                f"Destination : "
+                f"{train['destination']}\n"
+                f"Retard actuel : +{delay} min\n"
+                f"Retard précédent : "
+                f"+{previous_delay} min"
+            )
+
+        else:
+
+            message = (
+                f"Départ prévu : "
+                f"{departure_time}\n"
+                f"Départ estimé : "
+                f"{estimated_time}\n"
+                f"Destination : "
+                f"{train['destination']}\n"
+                f"Retard : +{delay} min"
             )
 
             if previous_delay >= 10:
